@@ -24,10 +24,13 @@
 | 显卡 | NVIDIA GPU，**驱动 ≥ 560**（CUDA 12.6 兼容线） |
 | Python | 3.12（由 uv 统一管理，无需手动安装） |
 | 包管理 | [uv](https://docs.astral.sh/uv/) |
+| VC++ 运行库 | 仅 Windows：需已安装 **VC++ 2015-2022 x64**（多数系统自带，缺失时见下方说明） |
 
 > ⚠️ **CUDA 版本注意**：本项目统一使用 **cu126** 版 PyTorch。驱动低于 560 时请先升级驱动；**不要改用 cu130**——旧驱动上会导致 GPU 访问违例闪退（`c10_cuda.dll 0xc0000005`）。
 >
 > 原版项目还支持 AMD ROCm 与 Apple Silicon，本仓库的安装流程仅在 NVIDIA + CUDA 12.6 上验证过。
+
+> ⚠️ **Windows 需安装 VC++ 运行库**：PyTorch 依赖 [Microsoft Visual C++ 2015-2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)。多数 Win10/11 已自带；若缺失（典型症状：启动闪退且无任何报错，精简系统 / 云电脑如 Windows Server 2022 尤其常见），请从上方链接下载安装后重新启动。
 
 ## 安装（基于 uv）
 

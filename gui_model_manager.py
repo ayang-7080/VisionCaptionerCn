@@ -1,0 +1,565 @@
+import os
+import json
+import shutil
+import sys
+import re
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, 
+                               QTableWidgetItem, QPushButton, QLabel, QHeaderView, 
+                               QMessageBox, QLineEdit, QTextEdit, QProgressBar, 
+                               QGroupBox, QWidget, QSizePolicy, QComboBox)
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QUrl
+from PySide6.QtGui import QColor, QTextCursor, QCursor, QDesktopServices
+
+# Try to import huggingface_hub
+try:
+    from huggingface_hub import snapshot_download
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
+# ModelScope support (lightweight detection; real import happens in worker thread)
+import importlib.util as _ilu
+MS_AVAILABLE = _ilu.find_spec("modelscope") is not None
+
+MODELS_FILE = "models.json"
+
+
+def _ms_repo_exists(repo_id):
+    """Check if a repo exists on ModelScope (same org/name as HuggingFace).
+    Returns False on any network error so callers can fall back to HF."""
+    try:
+        import requests
+        r = requests.get(f"https://modelscope.cn/api/v1/models/{repo_id}", timeout=10)
+        return r.status_code == 200 and r.json().get("Code") == 200
+    except Exception:
+        return False
+
+
+class DownloadWorker(QThread):
+    finished = Signal(bool, str)
+
+    def __init__(self, repo_id, folder_name, token=None, source="auto", ms_repo_id=None):
+        super().__init__()
+        self.repo_id = repo_id
+        self.folder_name = folder_name
+        self.token = token
+        self.source = source  # "auto" | "modelscope" | "hf"
+        # Optional ModelScope mirror repo (same model under a different org/name).
+        # Falls back to repo_id when the ModelScope repo has the identical org/name.
+        self.ms_repo_id = ms_repo_id or repo_id
+        self.dest_path = os.path.join(os.getcwd(), "models", self.folder_name)
+
+    def run(self):
+        try:
+            os.makedirs(os.path.join(os.getcwd(), "models"), exist_ok=True)
+
+            use_ms = False
+            if self.source in ("auto", "modelscope"):
+                if MS_AVAILABLE:
+                    use_ms = _ms_repo_exists(self.ms_repo_id)
+                    if self.source == "modelscope" and not use_ms:
+                        raise RuntimeError(
+                            f"'{self.ms_repo_id}' was not found on ModelScope.\n"
+                            f"This model is only available on HuggingFace.\n"
+                            f"Switch the download source back to 'Auto' or 'HuggingFace only'."
+                        )
+                elif self.source == "modelscope":
+                    raise RuntimeError(
+                        "modelscope package is not installed.\n"
+                        "Please run: pip install modelscope"
+                    )
+                # auto + no SDK -> silently fall back to HuggingFace
+
+            if use_ms:
+                from modelscope import snapshot_download as ms_snapshot_download
+                ms_snapshot_download(
+                    model_id=self.ms_repo_id,
+                    local_dir=self.dest_path,
+                )
+                src = "ModelScope"
+            else:
+                snapshot_download(
+                    repo_id=self.repo_id,
+                    local_dir=self.dest_path,
+                    token=self.token,
+                    local_dir_use_symlinks=False,
+                )
+                src = "HuggingFace"
+            self.finished.emit(True, f"Successfully downloaded {self.folder_name} ({src})")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+def _restart_application():
+    """Restart VisionCaptioner by launching a new process and exiting the current one."""
+    import subprocess
+    subprocess.Popen([sys.executable] + sys.argv)
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance().quit()
+
+
+from model_probe import ModelProbe
+
+
+class DeleteWorker(QThread):
+    finished = Signal(str)
+
+    def __init__(self, folder_name):
+        super().__init__()
+        self.path = os.path.join(os.getcwd(), "models", folder_name)
+
+    def run(self):
+        try:
+            if os.path.exists(self.path):
+                shutil.rmtree(self.path)
+            self.finished.emit("Deleted")
+        except Exception as e:
+            self.finished.emit(f"Error: {e}")
+
+from gui_workers import ScanWorker
+class ModelManagerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Model Manager")
+        self.resize(1100, 750) 
+        self.models_data = [] # JSON data
+        self.scan_data = {}   # Probe data
+        self.worker = None
+
+        self.setup_ui()
+        self.load_db()
+        
+        if not HF_AVAILABLE and not MS_AVAILABLE:
+            QMessageBox.critical(self, "Missing Library", "Neither huggingface_hub nor modelscope is installed.\nPlease run: pip install huggingface_hub modelscope")
+            self.table.setEnabled(False)
+        elif not HF_AVAILABLE:
+            # ModelScope only: downloads still work (HF-only models will fail)
+            print("Warning: huggingface_hub not installed - HuggingFace downloads unavailable.")
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # --- HuggingFace Group ---
+        hf_group = QGroupBox("HuggingFace Authentication")
+        hf_layout = QVBoxLayout(hf_group)
+
+        # 1. Toggle Button for Help
+        self.btn_help = QPushButton("❓ Need a Token? Click here for instructions")
+        self.btn_help.setCheckable(True) 
+        self.btn_help.setChecked(False) 
+        self.btn_help.setFlat(True) 
+        self.btn_help.setStyleSheet("text-align: left; font-weight: bold; color: #4da6ff;")
+        self.btn_help.setCursor(Qt.PointingHandCursor)
+        self.btn_help.toggled.connect(self.toggle_help)
+        hf_layout.addWidget(self.btn_help)
+
+        # 2. Collapsible Instructions Container
+        self.help_container = QWidget()
+        help_layout = QVBoxLayout(self.help_container)
+        help_layout.setContentsMargins(10, 0, 0, 10) 
+
+        instr_text = (
+            "<b>Some models (like SAM3) are 'Gated'. To download them:</b><br>"
+            "1. Create an account at <a href='https://huggingface.co/join'>huggingface.co</a><br>"
+            "2. Go to the model page (link in table below) and <b>Accept the License Agreement</b>.<br>"
+            "3. Generate a 'Read' token here: <a href='https://huggingface.co/settings/tokens'>huggingface.co/settings/tokens</a><br>"
+            "4. Paste the token below."
+        )
+        self.lbl_instr = QLabel(instr_text)
+        self.lbl_instr.setOpenExternalLinks(True)
+        self.lbl_instr.setWordWrap(True)
+        self.lbl_instr.setStyleSheet("color: #ccc; background-color: #222; padding: 10px; border-radius: 5px;")
+        help_layout.addWidget(self.lbl_instr)
+        self.help_container.setVisible(False) 
+        hf_layout.addWidget(self.help_container)
+
+        # 3. Token Input
+        token_layout = QHBoxLayout()
+        token_layout.addWidget(QLabel("Token:"))
+        self.txt_token = QLineEdit()
+        self.txt_token.setEchoMode(QLineEdit.Password)
+        self.txt_token.setPlaceholderText("hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        env_token = os.environ.get("HF_TOKEN")
+        if env_token:
+            self.txt_token.setPlaceholderText("Found HF_TOKEN in environment variables (Leave empty to use)")
+            self.txt_token.setToolTip("System HF_TOKEN detected.")
+        token_layout.addWidget(self.txt_token)
+        hf_layout.addLayout(token_layout)
+        layout.addWidget(hf_group)
+
+        # --- GGUF / llama-cpp-python Group ---
+        gguf_group = QGroupBox("GGUF Support (llama-cpp-python)")
+        gguf_layout = QVBoxLayout(gguf_group)
+
+        self.lbl_llama_status = QLabel()
+        self.lbl_llama_status.setWordWrap(True)
+        self.lbl_llama_status.setStyleSheet("color: #ccc; padding: 2px;")
+        gguf_layout.addWidget(self.lbl_llama_status)
+
+        llama_btn_layout = QHBoxLayout()
+        self.btn_install_llama = QPushButton("⬇️ Install / Update llama-cpp-python")
+        self.btn_install_llama.setToolTip(
+            "Detect your system (Python, CUDA) and install or upgrade\n"
+            "llama-cpp-python from JamePeng's GitHub releases."
+        )
+        self.btn_install_llama.clicked.connect(self.install_llama_cpp)
+        llama_btn_layout.addWidget(self.btn_install_llama)
+
+        self.btn_llama_github = QPushButton("🌐 Open GitHub Releases")
+        self.btn_llama_github.setToolTip("Open JamePeng/llama-cpp-python releases page in your browser")
+        self.btn_llama_github.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/JamePeng/llama-cpp-python/releases"))
+        )
+        llama_btn_layout.addWidget(self.btn_llama_github)
+
+        llama_btn_layout.addStretch()
+        gguf_layout.addLayout(llama_btn_layout)
+
+        self.llama_log = QTextEdit()
+        self.llama_log.setReadOnly(True)
+        self.llama_log.setFixedHeight(140)
+        self.llama_log.setStyleSheet("background-color: #1a1a1a; color: #ccc; font-family: Consolas, monospace; font-size: 9pt;")
+        self.llama_log.setVisible(False)
+        gguf_layout.addWidget(self.llama_log)
+
+        layout.addWidget(gguf_group)
+
+        self._refresh_llama_status()
+
+        # --- Actions Group ---
+        action_layout = QHBoxLayout()
+        action_layout.addWidget(QLabel("Download Source:"))
+        self.combo_source = QComboBox()
+        self.combo_source.addItem("Auto (ModelScope first)", "auto")
+        if MS_AVAILABLE:
+            self.combo_source.addItem("ModelScope only", "modelscope")
+        else:
+            self.combo_source.addItem("ModelScope only (SDK not installed)", "modelscope")
+        self.combo_source.addItem("HuggingFace only", "hf")
+        self.combo_source.setToolTip(
+            "Auto: download from ModelScope when the model exists there (fast in China),\n"
+            "otherwise fall back to HuggingFace.\n"
+            "ModelScope mirrors are public - no Token needed (except rare cases)."
+        )
+        action_layout.addWidget(self.combo_source)
+        action_layout.addSpacing(16)
+        self.btn_scan = QPushButton("🔍 Scan Local Models")
+        self.btn_scan.setToolTip("Refresh list and probe local models/GGUFs")
+        self.btn_scan.clicked.connect(self.start_scan)
+        action_layout.addWidget(self.btn_scan)
+        action_layout.addStretch()
+        layout.addLayout(action_layout)
+
+        # --- Table ---
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Model Name", "Description", "Status", "Gated", "Source", "Action"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+        
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.close)
+        layout.addWidget(self.btn_close)
+
+    def toggle_help(self, checked):
+        self.help_container.setVisible(checked)
+        if checked:
+            self.btn_help.setText("🔽 Hide Instructions")
+        else:
+            self.btn_help.setText("❓ Need a Token? Click here for instructions")
+
+    def load_db(self):
+        if not os.path.exists(MODELS_FILE):
+            print(f"Error: {MODELS_FILE} not found.")
+            return
+
+        try:
+            with open(MODELS_FILE, 'r') as f:
+                self.models_data = json.load(f)
+            # Initial scan
+            self.start_scan() 
+        except Exception as e:
+            print(f"Error loading JSON: {e}")
+            
+    def start_scan(self):
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("Scanning...")
+        self.worker = ScanWorker()
+        self.worker.finished.connect(self.on_scan_finished)
+        self.worker.start()
+        
+    def on_scan_finished(self, results):
+        self.btn_scan.setEnabled(True)
+        self.btn_scan.setText("🔍 Scan Local Models")
+        self.scan_data = results
+        self.refresh_table()
+        print(f"Scan complete. Found {len(results)} local models.")
+
+    def refresh_table(self):
+        self.table.setRowCount(0)
+        
+        # 1. Combine Known JSON models + Unknown Local models
+        # Create a set of folder names from JSON to identify "Extras"
+        json_folders = {m['folder'] for m in self.models_data}
+        
+        display_list = []
+        
+        # Add JSON models first
+        for m in self.models_data:
+            item = m.copy()
+            item['is_extra'] = False
+            # Check if installed using scan data
+            folder = m['folder']
+            if folder in self.scan_data:
+                item['installed'] = True
+                item['probe_info'] = self.scan_data[folder]
+            else:
+                item['installed'] = False
+            display_list.append(item)
+            
+        # Add Extra Local Models (GGUFs or Folders not in JSON)
+        for name, info in self.scan_data.items():
+            if name not in json_folders:
+                display_list.append({
+                    'name': name,
+                    'folder': name, # File or Folder name
+                    'description': "Locally discovered model",
+                    'gated': False,
+                    'is_extra': True,
+                    'installed': True,
+                    'probe_info': info
+                })
+        
+        self.table.setRowCount(len(display_list))
+        self.current_list = display_list
+
+        for i, m in enumerate(display_list):
+            # Name / Link
+            if not m.get('is_extra', False):
+                repo_url = f"https://huggingface.co/{m.get('repo_id', '')}"
+                link_html = f"<a href='{repo_url}' style='color: #4da6ff; text-decoration: underline;'>{m['name']}</a>"
+                lbl_link = QLabel(link_html)
+                lbl_link.setOpenExternalLinks(True)
+            else:
+                lbl_link = QLabel(m['name'])
+                if m['name'].endswith(".gguf"):
+                     lbl_link.setText(f"📦 {m['name']}")
+            
+            lbl_link.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            lbl_link.setStyleSheet("QLabel { margin-left: 5px; }")
+            self.table.setCellWidget(i, 0, lbl_link)
+            
+            # Reverted columns: No Type/Vision
+            self.table.setItem(i, 1, QTableWidgetItem(m.get('description', '')))
+            
+            # Status
+            status_text = "Installed" if m['installed'] else "Not Found"
+            status_item = QTableWidgetItem(status_text)
+            status_item.setForeground(QColor("#a3be8c") if m['installed'] else QColor("#bf616a"))
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 2, status_item)
+
+            gated = m.get('gated', False)
+            gated_item = QTableWidgetItem("Yes" if gated else "No")
+            gated_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 3, gated_item)
+
+            # Source: which download services carry this model
+            if m.get('is_extra', False):
+                source_item = QTableWidgetItem("-")
+            elif m.get('ms_repo_id'):
+                source_item = QTableWidgetItem("ModelScope / HF")
+                source_item.setForeground(QColor("#a3be8c"))
+                source_item.setToolTip(
+                    "ModelScope mirror available - fast download in China, no Token needed"
+                )
+            else:
+                source_item = QTableWidgetItem("HF only")
+                source_item.setForeground(QColor("#bf616a"))
+                source_item.setToolTip(
+                    "No ModelScope mirror - this model can only be downloaded from HuggingFace"
+                )
+            source_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 4, source_item)
+
+            # Action
+            btn = QPushButton()
+            if m['installed']:
+                btn.setText("Delete")
+                btn.setStyleSheet("background-color: #d73a49; color: white;")
+                # Fix closure with default argument
+                btn.clicked.connect(lambda checked, f=display_list[i]['folder']: self.delete_model(f)) 
+            else:
+                btn.setText("Download")
+                btn.setStyleSheet("background-color: #2da44e; color: white;")
+                # Fix closure with default argument
+                btn.clicked.connect(lambda checked, idx=i: self.download_model(idx))
+                if m.get('is_extra', False):
+                    btn.setEnabled(False) 
+            
+            self.table.setCellWidget(i, 5, btn)
+
+    def download_model(self, display_index):
+        item = self.current_list[display_index]
+        source = self.combo_source.currentData()
+
+        token = self.txt_token.text().strip() or None
+        if item.get('gated', False) and not token and source == "hf":
+            if "HF_TOKEN" not in os.environ:
+                ret = QMessageBox.warning(self, "Token Required?",
+                                    f"{item['name']} is a gated model on HuggingFace.\n"
+                                    f"If you haven't logged in via CLI, please enter a Token above.\n"
+                                    f"(Tip: with source 'Auto' or 'ModelScope', the public\n"
+                                    f"ModelScope mirror is used when available - no Token needed.)\n"
+                                    f"Try anyway?",
+                                    QMessageBox.Yes | QMessageBox.No)
+                if ret == QMessageBox.No: return
+
+        # UI Updates
+        btn = self.table.cellWidget(display_index, 5)
+        btn.setEnabled(False)
+        btn.setText("Downloading...")
+        # Yellowish background, black text
+        btn.setStyleSheet("background-color: #ebcb8b; color: black; font-weight: bold;")
+        
+        self.toggle_interface(False)
+        print(f"Starting download for {item['name']} (source: {source})...")
+        
+        self.worker = DownloadWorker(item['repo_id'], item['folder'], token, source, item.get('ms_repo_id'))
+        self.worker.finished.connect(self.on_download_finished)
+        self.worker.start()
+
+    def delete_model(self, folder_name):
+        ret = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete {folder_name}?\nThis cannot be undone.", QMessageBox.Yes | QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            self.toggle_interface(False)
+            print(f"Deleting {folder_name}...")
+            self.worker = DeleteWorker(folder_name)
+            self.worker.finished.connect(self.on_delete_finished)
+            self.worker.start()
+
+    def on_delete_finished(self, msg):
+        self.toggle_interface(True)
+        print(f"{msg}")
+        self.start_scan() # Refresh after delete
+    
+    def on_download_finished(self, success, msg):
+        self.toggle_interface(True)
+        if success:
+            print(f"SUCCESS: {msg}")
+            QMessageBox.information(self, "Done", "Download Complete!")
+        else:
+            print(f"ERROR: {msg}")
+            if "401" in msg or "403" in msg:
+                 QMessageBox.critical(self, "Auth Error", "Authentication failed.\nDid you provide a valid Token?")
+            else:
+                QMessageBox.critical(self, "Error", f"Download failed:\n{msg}")
+        self.start_scan() # Refresh
+
+    # --- llama-cpp-python install/upgrade ---
+
+    def _refresh_llama_status(self):
+        """Update the llama-cpp-python status label."""
+        try:
+            import llama_cpp
+            ver = getattr(llama_cpp, "__version__", "unknown")
+            self.lbl_llama_status.setText(f"✅ Installed — llama-cpp-python <b>{ver}</b>")
+            self.btn_install_llama.setText("⬆️ Upgrade llama-cpp-python")
+        except ImportError:
+            self.lbl_llama_status.setText("❌ Not installed — required for GGUF models")
+            self.btn_install_llama.setText("⬇️ Install llama-cpp-python")
+
+    def install_llama_cpp(self):
+        """Detect the system and install/upgrade llama-cpp-python."""
+        from llama_cpp_installer import detect_system, GITHUB_PAGE
+
+        info = detect_system()
+
+        # Show what we detected and ask for confirmation
+        lines = [
+            "Detected environment:",
+            f"  Python:    {info['python_tag']}",
+            f"  Platform:  {info['platform']}",
+        ]
+        if info["platform"] == "macos":
+            lines.append("  Backend:   Metal (Apple GPU)")
+        else:
+            lines.append(f"  CUDA:      {info['cuda_version'] or 'not detected'}")
+            if info["cuda_tag"]:
+                lines.append(f"  Package:   {info['cuda_tag']}")
+
+        lines.append(f"\nSource: JamePeng/llama-cpp-python")
+        lines.append(f"{GITHUB_PAGE}")
+
+        if not info["cuda_tag"] and info["platform"] != "macos":
+            lines.append("\nCould not determine CUDA version — automatic install")
+            lines.append("is not possible. Please visit the GitHub page and")
+            lines.append("download the correct wheel for your system manually.")
+            QMessageBox.warning(self, "Cannot Auto-Detect", "\n".join(lines))
+            return
+
+        lines.append("\nThis will download and pip install the matching wheel.")
+        lines.append("Proceed?")
+
+        ret = QMessageBox.question(
+            self, "Install / Upgrade llama-cpp-python?",
+            "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        # Show log area and start the worker
+        self.llama_log.setVisible(True)
+        self.llama_log.clear()
+        self.toggle_interface(False)
+        self.btn_install_llama.setEnabled(False)
+        self.btn_install_llama.setText("Installing...")
+
+        from gui_workers import LlamaCppInstallWorker
+        self._install_worker = LlamaCppInstallWorker()
+        self._install_worker.log.connect(self._on_llama_log)
+        self._install_worker.finished.connect(self._on_llama_install_finished)
+        self._install_worker.start()
+
+    def _on_llama_log(self, msg):
+        self.llama_log.append(msg)
+        # Auto-scroll to bottom
+        self.llama_log.verticalScrollBar().setValue(self.llama_log.verticalScrollBar().maximum())
+
+    def _on_llama_install_finished(self, success, message):
+        self.toggle_interface(True)
+        self.btn_install_llama.setEnabled(True)
+        self._refresh_llama_status()
+
+        if success:
+            ret = QMessageBox.question(
+                self, "Installation Complete",
+                "llama-cpp-python was installed successfully.\n\n"
+                "A restart is required for the new package to take effect.\n\n"
+                "Restart VisionCaptioner now?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ret == QMessageBox.Yes:
+                _restart_application()
+        else:
+            from llama_cpp_installer import GITHUB_PAGE
+            QMessageBox.critical(
+                self, "Installation Failed",
+                f"Could not install llama-cpp-python automatically.\n\n"
+                f"{message}\n\n"
+                f"You can try installing manually from:\n{GITHUB_PAGE}"
+            )
+
+    def toggle_interface(self, enabled):
+        self.table.setEnabled(enabled)
+        self.btn_close.setEnabled(enabled)
+        self.btn_scan.setEnabled(enabled)
+        self.combo_source.setEnabled(enabled)
+        self.btn_install_llama.setEnabled(enabled)
+        self.btn_llama_github.setEnabled(enabled)
+
+    def closeEvent(self, event):
+        super().closeEvent(event)

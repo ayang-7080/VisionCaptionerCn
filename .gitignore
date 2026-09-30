@@ -1,0 +1,34 @@
+# IDEs
+.vscode/
+.idea/
+
+# OS Specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and Temp
+*.log
+*.tmp
+*.bak
+
+# Python compiled files
+__pycache__/
+*.pyc
+
+# Ignore model files, but keep the folder
+models/*
+!models/.gitkeep
+
+# Virtual Environment
+venv/
+
+# Embedded portable Python runtime (only for Windows zip distribution)
+runtime/
+
+# Configuration files (the GUI will create this)
+settings.json
+model_cache.json
+
+# Personal notes
+ideas.md

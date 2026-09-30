@@ -1,0 +1,36 @@
+{
+    "'person' -> 'woman'": {
+        "find": "person",
+        "replace": "woman"
+    },
+    "'person' -> 'man'": {
+        "find": "person",
+        "replace": "man"
+    },
+    "'man' -> 'woman'": {
+        "find": "man",
+        "replace": "woman"
+    },
+    "'woman' -> 'man'": {
+        "find": "woman",
+        "replace": "man"
+    },
+    "Remove '3D rendering'": {
+        "find": "3D rendering",
+        "replace": ""
+    },
+    "Remove 'Image of'": {
+        "find": "^(An )?image of ",
+        "regex": true,
+        "replace": ""
+    },
+    "Cleanup Whitespace": {
+        "find": "\\s+",
+        "regex": true,
+        "replace": " "
+    },
+    "Fix: Double Spaces": {
+        "find": "  ",
+        "replace": " "
+    }
+}

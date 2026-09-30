@@ -1,0 +1,12 @@
+原始项目：https://github.com/Brekel/VisionCaptioner
+
+基于UV环境：
+# 1. 创建 venv（只需一次）
+uv venv venv --seed --python 3.12
+
+# 2. 装 CUDA 版 torch（注意 --python 指向 venv）
+# 本机驱动 560.94 只支持到 CUDA 12.6，必须用 cu126（cu130 会闪退：c10_cuda.dll 0xc0000005）
+uv pip install --python venv\Scripts\python.exe torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# 3. 装其余依赖
+uv pip install --python venv\Scripts\python.exe -r requirements.txt

@@ -187,6 +187,21 @@ class QwenEngine:
         self.device = self.get_device_type()
         self.is_gguf = False
         self.family = QwenFamily()
+        self.api_client = None
+
+    @property
+    def is_api(self):
+        return getattr(self, "api_client", None) is not None
+
+    def load_api(self, base_url, api_key, model, max_resolution=768, timeout=120):
+        from api_backend import ApiCaptionClient
+        try:
+            client = ApiCaptionClient(base_url, api_key, model, max_resolution, timeout)
+        except (ValueError, TypeError):
+            return False, "Invalid API configuration. Check HTTP(S) address, model, Key and timeout (1–600s)."
+        self.unload_model()
+        self.api_client = client
+        return True, "API configuration applied. Use TEST FIRST IMAGE/VIDEO to verify the service."
 
     def get_device_type(self):
         """Detects the available hardware acceleration."""
@@ -226,6 +241,7 @@ class QwenEngine:
         return results
 
     def unload_model(self):
+        self.api_client = None
         # 1. Clear compiled graphs
         try:
             if hasattr(torch, "_dynamo"):
@@ -554,7 +570,11 @@ class QwenEngine:
             print(f"Error applying mask: {e}")
             return None
 
-    def generate_batch(self, file_paths, prompt_text="Describe this.", trigger_word="", frame_count=8, mask_paths=None, max_tokens=1024, log_callback=None, stop_event=None):
+    def generate_batch(self, file_paths, prompt_text="Describe this.", trigger_word="", frame_count=8, mask_paths=None, max_tokens=1024, log_callback=None, stop_event=None, raise_errors=False):
+        if self.is_api:
+            return self.api_client.generate_batch(
+                self, file_paths, prompt_text, trigger_word, frame_count, mask_paths,
+                max_tokens, log_callback, stop_event, raise_errors=raise_errors)
         if not self.model: return ["Error: Model not loaded"] * len(file_paths)
 
         # --- GGUF GENERATION BRANCH ---

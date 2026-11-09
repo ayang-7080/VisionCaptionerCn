@@ -76,6 +76,7 @@ _qt_core = MagicMock()
 _qt_core.Qt = _FakeQt
 _qt_core.Signal = _FakeSignal
 _qt_core.QThread = _FakeQThread
+_qt_core.QObject = type("QObject", (), {"__init__": lambda *a, **kw: None})
 _qt_core.QTimer = MagicMock()
 _qt_core.QByteArray = MagicMock()
 

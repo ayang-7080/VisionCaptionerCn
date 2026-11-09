@@ -6,6 +6,7 @@ import cv2 # Added for video processing
 import numpy as np # Added for array handling
 from tqdm import tqdm
 from backend import QwenEngine, SAM3Engine
+from api_backend import DEFAULT_API_BASE_URL, DEFAULT_API_MODEL, DEFAULT_API_CONCURRENCY
 from PIL import Image, ImageOps
 from file_utils import find_media_files, IMAGE_EXTS, VIDEO_EXTS
 
@@ -34,10 +35,17 @@ def load_defaults_from_settings():
         return {}
     
     try:
-        with open(SETTINGS_FILE, "r") as f:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         
+        api_data = data.get("generate_tab", {})
         gen_defaults = {
+            "backend": api_data.get("backend", "local"),
+            "api_base_url": api_data.get("api_base_url") or DEFAULT_API_BASE_URL,
+            "api_model": api_data.get("api_model") or DEFAULT_API_MODEL,
+            "api_key": api_data.get("api_key", "") if api_data.get("remember_api_key", False) else "",
+            "api_timeout": api_data.get("api_timeout", 120),
+            "api_concurrency": api_data.get("api_concurrency", DEFAULT_API_CONCURRENCY),
             "model_index": data.get("generate_tab", {}).get("model_index", 0),
             "quant": parse_quant_string(data.get("generate_tab", {}).get("quantization", "None")),
             "res": RES_MAP.get(data.get("generate_tab", {}).get("resolution_idx", 1), 512),
@@ -121,6 +129,12 @@ def main():
 
     # Captioning Config (Qwen)
     grp_cap = parser.add_argument_group("Captioning Arguments")
+    grp_cap.add_argument("--backend", choices=["local", "api"], default=defaults.get("backend", "local"), help="Local model or OpenAI-compatible online API.")
+    grp_cap.add_argument("--api-base-url", default=defaults.get("api_base_url", DEFAULT_API_BASE_URL), help="API base URL or full chat/completions endpoint.")
+    grp_cap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", defaults.get("api_key", "")), help="API Key (prefer OPENAI_API_KEY environment variable).")
+    grp_cap.add_argument("--api-model", default=defaults.get("api_model", DEFAULT_API_MODEL), help="Provider's vision model name.")
+    grp_cap.add_argument("--api-concurrency", type=int, choices=range(1, 33), default=defaults.get("api_concurrency", DEFAULT_API_CONCURRENCY), help="Maximum simultaneous online API requests (1–32).")
+    grp_cap.add_argument("--api-timeout", type=int, default=defaults.get("api_timeout", 120), help="API request timeout in seconds (1–600).")
     grp_cap.add_argument("--model", type=str, help="Path to Qwen model.")
     grp_cap.add_argument("--quant", type=str, default=defaults.get("quant", "None"), choices=["None", "FP16", "FP8", "Int8", "NF4"], help="Quantization level.")
     grp_cap.add_argument("--res", type=int, default=defaults.get("res", 512), help="Max resolution for captioning.")
@@ -173,7 +187,9 @@ def main():
     if args.mode == "caption":
         # ... (Same as existing code)
         model_path = None
-        if args.model:
+        if args.backend == "api":
+            model_path = args.api_model
+        elif args.model:
             if os.path.exists(args.model):
                 model_path = args.model
             else:
@@ -196,7 +212,7 @@ def main():
 
         print(f"\n🚀 --- VisionCaptioner CLI (Caption Mode) ---")
         print(f"📁 Folder:   {args.folder}")
-        print(f"🧠 Model:    {os.path.basename(model_path)}")
+        print(f"🧠 Model:    {args.api_model if args.backend == 'api' else os.path.basename(model_path)}")
         print(f"⚙️  Settings: Res={args.res}, Quant={args.quant}, Batch={args.batch_size}")
         print(f"📝 Prompt:   {final_prompt[:50]}...")
         if args.skip_existing:
@@ -217,14 +233,45 @@ def main():
         has_video = any(f.lower().endswith(video_exts_set) for f, _ in all_pairs)
         media_mode = "video" if has_video else "image"
 
-        success, msg = engine.load_model(model_path, quantization_type=args.quant, max_resolution=args.res, vision_token_budget=args.vision_tokens, media_mode=media_mode)
+        if args.backend == "api":
+            success, msg = engine.load_api(args.api_base_url, args.api_key, args.api_model,
+                                           max_resolution=args.res, timeout=args.api_timeout)
+        else:
+            success, msg = engine.load_model(model_path, quantization_type=args.quant, max_resolution=args.res, vision_token_budget=args.vision_tokens, media_mode=media_mode)
         if not success:
             print(f"❌ Model Load Failed: {msg}")
             return
 
         try:
             total = len(all_pairs)
-            batch_size = args.batch_size
+            if args.backend == "api":
+                from online_batch import iter_online_results, save_online_caption, select_online_pairs
+                import signal
+                import threading
+                stop = threading.Event()
+                previous_handler = signal.signal(signal.SIGINT, lambda *_: stop.set())
+                try:
+                    print(f"API concurrency: {args.api_concurrency}")
+                    pending, skipped = select_online_pairs(all_pairs, args.skip_existing, stop.is_set)
+                    with tqdm(total=total, unit="img") as pbar:
+                        pbar.update(skipped)
+                        for path, caption in iter_online_results(
+                                engine, pending, concurrency=args.api_concurrency,
+                                prompt_text=final_prompt, trigger_word=args.trigger,
+                                frame_count=args.frame_count, max_tokens=args.max_tokens,
+                                log_callback=print, stop_event=stop.is_set):
+                            if caption.startswith("Error:"):
+                                print(f"Skipping {os.path.basename(path)}: {caption}")
+                            else:
+                                try:
+                                    save_online_caption(path, caption, skip_existing=args.skip_existing)
+                                except OSError as exc:
+                                    print(f"Could not save {os.path.basename(path)}: {exc}")
+                            pbar.update(1)
+                finally:
+                    signal.signal(signal.SIGINT, previous_handler)
+                return
+            batch_size = 1 if args.backend == "api" else args.batch_size
             
             with tqdm(total=total, unit="img") as pbar:
                 for i in range(0, total, batch_size):
@@ -253,6 +300,7 @@ def main():
                     for idx, f_path in enumerate(final_files):
                         cap = captions[idx]
                         if "Error:" in cap or "[Video Load Error]" in cap:
+                            print(f"Skipping {os.path.basename(f_path)}: {cap}")
                             continue
                         txt_path = os.path.splitext(f_path)[0] + ".txt"
                         with open(txt_path, "w", encoding="utf-8") as f:

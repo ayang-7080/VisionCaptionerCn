@@ -5,13 +5,14 @@ import datetime
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
                                QProgressBar, QComboBox, QCheckBox, QTextEdit, QSpinBox, 
                                QGroupBox, QSplitter, QSizePolicy, QApplication, QLineEdit,
-                               QMessageBox, QGridLayout)
+                               QMessageBox, QGridLayout, QScrollArea)
 from PySide6.QtCore import Qt, Signal, QByteArray
 from gui_widgets import ResizableImageLabel, ShutdownCountdownDialog
-from gui_workers import ModelLoaderWorker, TestWorker, CaptionWorker, LlamaCppInstallWorker
+from gui_workers import ModelLoaderWorker, TestWorker, CaptionWorker, LlamaCppInstallWorker, ApiChatTestWorker
 from gui_model_manager import ModelManagerDialog
 from file_utils import find_media_files, VIDEO_EXTS
 from backend import fp8_supported, fp8_unsupported_reason
+from api_backend import ApiCaptionClient, DEFAULT_API_BASE_URL, DEFAULT_API_MODEL, DEFAULT_API_TEST_PROMPT, DEFAULT_API_CONCURRENCY
 
 
 class CaptionsTab(QWidget):
@@ -27,6 +28,8 @@ class CaptionsTab(QWidget):
         self.worker = None
         self.test_worker = None
         self.loader_worker = None
+        self.api_test_worker = None
+        self._api_concurrency = DEFAULT_API_CONCURRENCY
         self.current_folder = ""
         self.recursive = False
         self.PROMPTS_DIR = "prompts"
@@ -40,10 +43,55 @@ class CaptionsTab(QWidget):
         # --- LEFT PANEL (Settings) ---
         left_panel = QGroupBox("Generation Settings")
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setFixedWidth(380)
+        left_panel.setMinimumWidth(310)
+
+        left_layout.addWidget(QLabel("Inference Mode:"))
+        self.combo_backend = QComboBox()
+        self.combo_backend.addItem("Local Model", "local")
+        self.combo_backend.addItem("Online API (OpenAI compatible)", "api")
+        left_layout.addWidget(self.combo_backend)
+
+        self.api_group = QGroupBox("Online API Settings")
+        api_layout = QGridLayout(self.api_group)
+        self.txt_api_url = QLineEdit()
+        self.txt_api_url.setText(DEFAULT_API_BASE_URL)
+        self.txt_api_url.setPlaceholderText(DEFAULT_API_BASE_URL)
+        self.txt_api_url.setToolTip("API base URL (including provider path), or full /chat/completions endpoint.")
+        self.txt_api_key = QLineEdit()
+        self.txt_api_key.setEchoMode(QLineEdit.Password)
+        self.txt_api_key.setPlaceholderText("API Key or OPENAI_API_KEY")
+        self.txt_api_model = QLineEdit()
+        self.txt_api_model.setText(DEFAULT_API_MODEL)
+        self.txt_api_model.setPlaceholderText("Vision model name from your provider")
+        self.spin_api_timeout = QSpinBox()
+        self.spin_api_timeout.setRange(1, 600)
+        self.spin_api_timeout.setValue(120)
+        for row, (label, field) in enumerate([
+            ("API Base URL:", self.txt_api_url), ("API Key:", self.txt_api_key),
+            ("API Model:", self.txt_api_model), ("Timeout (seconds):", self.spin_api_timeout),
+        ]):
+            api_layout.addWidget(QLabel(label), row, 0)
+            api_layout.addWidget(field, row, 1)
+        self.chk_remember_api_key = QCheckBox("Remember Key (plain text locally)")
+        self.chk_remember_api_key.setToolTip("When checked, the API Key is saved in settings.json. Otherwise it is used only for this session.")
+        api_layout.addWidget(self.chk_remember_api_key, 4, 0, 1, 2)
+        api_notice = QLabel("Images/video frames are sent to your provider. API usage may incur charges.")
+        api_notice.setWordWrap(True)
+        api_layout.addWidget(api_notice, 5, 0, 1, 2)
+        self.txt_api_test_prompt = QLineEdit()
+        self.txt_api_test_prompt.setText(DEFAULT_API_TEST_PROMPT)
+        api_layout.addWidget(QLabel("Test Prompt:"), 6, 0)
+        api_layout.addWidget(self.txt_api_test_prompt, 6, 1)
+        self.btn_api_chat = QPushButton("Test Conversation")
+        self.btn_api_chat.setToolTip("Send a text-only test using the settings above. No image folder or model loading required.")
+        self.btn_api_chat.clicked.connect(self.run_api_chat_test)
+        api_layout.addWidget(self.btn_api_chat, 7, 0, 1, 2)
+        left_layout.addWidget(self.api_group)
+        self.api_group.hide()
 
         # Model
-        left_layout.addWidget(QLabel("Model Path:"))
+        self.lbl_model_path = QLabel("Model Path:")
+        left_layout.addWidget(self.lbl_model_path)
         
         model_select_layout = QHBoxLayout()
         
@@ -88,7 +136,8 @@ class CaptionsTab(QWidget):
         grid_model.setContentsMargins(0, 0, 0, 0)
         
         # Row 1: Quantization & Resolution
-        grid_model.addWidget(QLabel("Quantization:"), 0, 0)
+        self.lbl_quant = QLabel("Quantization:")
+        grid_model.addWidget(self.lbl_quant, 0, 0)
         self.combo_quant = QComboBox()
         self.combo_quant.addItems(["None (BF16 - Default)", "FP16 (Half Precision)", "FP8 (8-bit, Ada+)", "Int8 (BitsAndBytes)", "NF4 (4-bit)"])
         self.combo_quant.setToolTip(
@@ -156,7 +205,8 @@ class CaptionsTab(QWidget):
         grid_params = QGridLayout()
         grid_params.setContentsMargins(0, 0, 0, 0)
         
-        grid_params.addWidget(QLabel("Batch Size:"), 0, 0)
+        self.lbl_batch = QLabel("Batch Size:")
+        grid_params.addWidget(self.lbl_batch, 0, 0)
         self.spin_batch = QSpinBox()
         self.spin_batch.setRange(1, 512)
         self.spin_batch.setValue(8)
@@ -230,7 +280,11 @@ class CaptionsTab(QWidget):
         self.txt_suffix.setToolTip("Text added to the end of the system prompt.\nUseful for enforcing rules like 'No moralizing' or 'Be concise'.")
         left_layout.addWidget(self.txt_suffix)
 
-        main_layout.addWidget(left_panel)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFixedWidth(360)
+        settings_scroll.setWidget(left_panel)
+        main_layout.addWidget(settings_scroll)
 
         # --- RIGHT PANEL (Preview & Controls) ---
         right_panel = QWidget()
@@ -250,6 +304,7 @@ class CaptionsTab(QWidget):
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         
         self.lbl_filename = QLabel("")
+        self.lbl_filename.setWordWrap(True)
         self.lbl_filename.setAlignment(Qt.AlignCenter)
         self.lbl_filename.setStyleSheet("font-weight: bold; color: #ccc; margin-top: 1px; margin-bottom: 1px;")
         
@@ -305,6 +360,7 @@ class CaptionsTab(QWidget):
         right_layout.addLayout(proc_layout)
 
         self.progress = QProgressBar()
+        self.progress.setFormat("0 / 0 (0.00%)")
         self.progress.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #555;
@@ -322,6 +378,7 @@ class CaptionsTab(QWidget):
         right_layout.addWidget(self.progress)
         
         self.lbl_status = QLabel("Ready")
+        self.lbl_status.setWordWrap(True)
         self.lbl_status.setAlignment(Qt.AlignCenter)
         self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #ccc;")
         right_layout.addWidget(self.lbl_status)
@@ -329,11 +386,76 @@ class CaptionsTab(QWidget):
         main_layout.addWidget(right_panel)
 
         self.populate_models()
+        self.combo_backend.currentIndexChanged.connect(self.on_backend_changed)
+        self.on_backend_changed()
 
     # --- METHODS ---
+    def run_api_chat_test(self):
+        if self.combo_backend.currentData() != "api" or not self.btn_api_chat.isEnabled():
+            return
+        if self.api_test_worker and self.api_test_worker.isRunning():
+            return
+        prompt = self.txt_api_test_prompt.text().strip()
+        try:
+            if not prompt:
+                raise ValueError()
+            client = ApiCaptionClient(
+                self.txt_api_url.text(), self.txt_api_key.text(), self.txt_api_model.text(),
+                timeout=self.spin_api_timeout.value())
+        except (ValueError, TypeError):
+            self.on_api_chat_result(False, "Check API address, model, Key, timeout and test prompt.")
+            return
+
+        self.toggle_ui(False, loaded=self.engine.is_api or self.engine.model is not None)
+        self.btn_api_chat.setText("Testing API...")
+        self.lbl_status.setText("Testing API...")
+        self.lbl_filename.setText("API Test Conversation")
+        self.txt_preview.clear()
+        self.api_test_worker = ApiChatTestWorker(client, prompt, self.spin_tokens.value(), self)
+        self.api_test_worker.result_ready.connect(self.on_api_chat_result)
+        self.api_test_worker.finished.connect(self.on_api_chat_finished)
+        self.api_test_worker.start()
+
+    def on_api_chat_result(self, success, text):
+        self.lbl_filename.setText("API Test Conversation")
+        self.txt_preview.setPlainText(text if success else f"Error: {text}")
+        self.lbl_status.setText("API test succeeded" if success else "API test failed")
+        self.log_msg.emit("API test succeeded." if success else f"API test failed: {text}")
+
+    def on_api_chat_finished(self):
+        self.btn_api_chat.setText("Test Conversation")
+        self.toggle_ui(True, loaded=self.engine.is_api or self.engine.model is not None)
+        self._apply_gguf_batch_lock()
+
+    def on_backend_changed(self):
+        # Switching is disabled while a worker is running. Release any loaded
+        # backend before configuring the next one; keep both sets of UI values.
+        if self.engine.model is not None or self.engine.is_api:
+            self.engine.unload_model()
+        online = self.combo_backend.currentData() == "api"
+        self.api_group.setVisible(online)
+        for widget in (self.lbl_model_path, self.model_combo, self.btn_manager,
+                       self.lbl_quant, self.combo_quant, self.lbl_vis_tokens, self.combo_vis_tokens):
+            widget.setVisible(not online)
+        self.btn_load.setText("Apply API Settings" if online else "Load Model")
+        self.btn_load.setToolTip("Apply settings, then test the first image to verify the API." if online
+                                 else "Load the selected model into memory (VRAM).")
+        self.combo_res.setToolTip("Maximum side length of uploaded images/video frames." if online
+                                 else "Maximum side length for resizing images. (Qwen family only — ignored for Gemma.)")
+        self.spin_tokens.setToolTip("API completion budget includes reasoning tokens. Increase it if no visible answer is returned due to the token limit." if online
+                                    else "Maximum length of the generated text description.")
+        self.btn_unload.setToolTip("Deactivate the current backend.")
+        self.toggle_ui(True, loaded=False)
+        self._apply_gguf_batch_lock()
+        self.lbl_status.setText("Ready")
+
     def on_model_combo_changed(self):
         # Defensive check: Ensure UI elements exist before accessing them
         if not hasattr(self, 'combo_quant') or not hasattr(self, 'combo_res'):
+            return
+        if self.combo_backend.currentData() == "api":
+            self.combo_quant.setEnabled(False)
+            self.combo_vis_tokens.setEnabled(False)
             return
 
         # Use currentData() to get the actual model name/filename, not the display text
@@ -479,11 +601,19 @@ class CaptionsTab(QWidget):
     def get_settings(self):
         """Returns a dict of currently selected settings."""
         return {
+            "backend": self.combo_backend.currentData(),
+            "api_base_url": self.txt_api_url.text().strip(),
+            "api_model": self.txt_api_model.text().strip(),
+            "api_key": self.txt_api_key.text() if self.chk_remember_api_key.isChecked() else "",
+            "remember_api_key": self.chk_remember_api_key.isChecked(),
+            "api_timeout": self.spin_api_timeout.value(),
+            "api_test_prompt": self.txt_api_test_prompt.text(),
+            "api_concurrency": self.spin_batch.value() if self.combo_backend.currentData() == "api" else self._api_concurrency,
             "model": self.model_combo.currentData(), # Save the real name/path, not display text
             "quantization": self.combo_quant.currentText(),
             "resolution_idx": self.combo_res.currentIndex(),
             "vision_tokens_idx": self.combo_vis_tokens.currentIndex() if hasattr(self, 'combo_vis_tokens') else 0,
-            "batch_size": self.spin_batch.value(),
+            "batch_size": getattr(self, "_api_saved_batch_size", self.spin_batch.value()),
             "frames": self.spin_frames.value(),
             "tokens": self.spin_tokens.value(),
             "skip_existing": self.chk_skip.isChecked(),
@@ -499,6 +629,18 @@ class CaptionsTab(QWidget):
     def set_settings(self, settings):
         """Loads settings from a dict."""
         if not settings: return
+
+        self.txt_api_url.setText(settings.get("api_base_url") or DEFAULT_API_BASE_URL)
+        self.txt_api_model.setText(settings.get("api_model") or DEFAULT_API_MODEL)
+        remember = settings.get("remember_api_key", False)
+        self.chk_remember_api_key.setChecked(remember)
+        self.txt_api_key.setText(settings.get("api_key", "") if remember else "")
+        self.spin_api_timeout.setValue(settings.get("api_timeout", 120))
+        self.txt_api_test_prompt.setText(settings.get("api_test_prompt", DEFAULT_API_TEST_PROMPT))
+        self.combo_backend.setCurrentIndex(1 if settings.get("backend") == "api" else 0)
+        self._api_concurrency = min(32, max(1, int(settings.get("api_concurrency", DEFAULT_API_CONCURRENCY))))
+        if self.combo_backend.currentData() == "api":
+            self.spin_batch.setValue(self._api_concurrency)
 
         def set_combo_by_text(combo, text):
             idx = combo.findText(text)
@@ -519,7 +661,11 @@ class CaptionsTab(QWidget):
         if "vision_tokens_idx" in settings and hasattr(self, 'combo_vis_tokens'):
             self.combo_vis_tokens.setCurrentIndex(min(max(0, settings["vision_tokens_idx"]), self.combo_vis_tokens.count()-1))
 
-        if "batch_size" in settings: self.spin_batch.setValue(settings["batch_size"])
+        if "batch_size" in settings:
+            if self.combo_backend.currentData() == "api":
+                self._api_saved_batch_size = settings["batch_size"]
+            else:
+                self.spin_batch.setValue(settings["batch_size"])
         if "frames" in settings: self.spin_frames.setValue(settings["frames"])
         if "tokens" in settings: self.spin_tokens.setValue(settings["tokens"])
         if "skip_existing" in settings: self.chk_skip.setChecked(settings["skip_existing"])
@@ -555,6 +701,12 @@ class CaptionsTab(QWidget):
         return "video" if videos else "image"
 
     def load_model(self):
+        if self.combo_backend.currentData() == "api":
+            success, msg = self.engine.load_api(
+                self.txt_api_url.text(), self.txt_api_key.text(), self.txt_api_model.text(),
+                max_resolution=self.combo_res.currentData(), timeout=self.spin_api_timeout.value())
+            self.on_model_loaded(success, msg)
+            return
         self.toggle_ui(False)
         self.lbl_status.setText("Loading Model... Please Wait")
         self.progress.setRange(0, 0)
@@ -698,6 +850,21 @@ class CaptionsTab(QWidget):
         self._apply_gguf_batch_lock()
 
     def _apply_gguf_batch_lock(self):
+        if self.combo_backend.currentData() == "api":
+            if not hasattr(self, "_api_saved_batch_size"):
+                self._api_saved_batch_size = self.spin_batch.value()
+                self.spin_batch.setRange(1, 32)
+                self.spin_batch.setValue(self._api_concurrency)
+            self.lbl_batch.setText("API Concurrency:")
+            self.spin_batch.setEnabled(True)
+            self.spin_batch.setToolTip("Maximum simultaneous API requests (1–32). Completed captions are saved immediately. Lower this if your provider rate-limits requests.")
+            return
+        if hasattr(self, "_api_saved_batch_size"):
+            self._api_concurrency = self.spin_batch.value()
+            self.spin_batch.setRange(1, 512)
+            self.spin_batch.setValue(self._api_saved_batch_size)
+            del self._api_saved_batch_size
+        self.lbl_batch.setText("Batch Size:")
         is_gguf = bool(getattr(self.engine, "is_gguf", False)) and self.engine.model is not None
         if is_gguf:
             self.spin_batch.setEnabled(False)
@@ -719,9 +886,20 @@ class CaptionsTab(QWidget):
         self.request_lock.emit(not enabled)
         
         settings_enabled = enabled and not loaded
-        
-        self.model_combo.setEnabled(settings_enabled)
-        self.combo_quant.setEnabled(settings_enabled)
+        online = self.combo_backend.currentData() == "api"
+        self.combo_backend.setEnabled(enabled)
+        self.api_group.setEnabled(enabled and online)
+        for widget in (self.txt_api_url, self.txt_api_key, self.txt_api_model,
+                       self.spin_api_timeout, self.chk_remember_api_key):
+            widget.setEnabled(settings_enabled)
+        self.btn_api_chat.setEnabled(enabled and online)
+        self.btn_manager.setEnabled(settings_enabled and not online)
+        self.btn_load.setEnabled(settings_enabled)
+        self.btn_unload.setEnabled(enabled and loaded)
+        self.spin_batch.setEnabled(enabled and not (getattr(self.engine, "is_gguf", False) and self.engine.model is not None))
+
+        self.model_combo.setEnabled(settings_enabled and not online)
+        self.combo_quant.setEnabled(settings_enabled and not online)
         self.combo_res.setEnabled(settings_enabled)
         if hasattr(self, 'combo_vis_tokens'):
             # Re-evaluate Gemma-only enable when re-enabling
@@ -753,21 +931,38 @@ class CaptionsTab(QWidget):
         settings = {"frame_count": self.spin_frames.value(), "max_tokens": self.spin_tokens.value(), "prompt": p, "trigger": self.txt_trigger.text(), "use_masks": self.chk_use_masks.isChecked(), "recursive": self.recursive}
 
         self.lbl_status.setText("Testing..." if mode == "random" else "Testing First Image...")
+        self.txt_preview.clear()
+        self.progress.setRange(0, 0)
 
         self.test_worker = TestWorker(self.engine, self.current_folder, settings, mode)
         self.test_worker.result_ready.connect(lambda f, c, t: self.on_test_done(f, c, t))
-        self.test_worker.error.connect(lambda e: self.log_msg.emit(f"Error: {e}"))
+        self.test_worker.target_ready.connect(self.on_test_target)
+        self.test_worker.error.connect(self.on_test_error)
 
         self.test_worker.log_signal.connect(self.log_msg.emit)
         
-        self.test_worker.finished.connect(lambda: self.toggle_ui(True))
-        self.test_worker.finished.connect(lambda: self.btn_unload.setEnabled(True))
+        self.test_worker.finished.connect(self.on_test_finished)
         
         self.test_worker.start()
 
+    def on_test_target(self, path):
+        self.lbl_preview.set_image(path)
+        self.lbl_filename.setText(os.path.basename(path))
+
+    def on_test_error(self, message):
+        self.lbl_status.setText("Image test failed")
+        self.txt_preview.setPlainText(message)
+        self.log_msg.emit(message if message.startswith("Error:") else f"Error: {message}")
+
+    def on_test_finished(self):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("Image test finished")
+        self.toggle_ui(True, loaded=self.engine.is_api or self.engine.model is not None)
+
     def on_test_done(self, f, c, t):
         self.lbl_preview.set_image(f)
-        self.txt_preview.setText(c)
+        self.txt_preview.setPlainText(c)
         self.lbl_filename.setText(os.path.basename(f))
         self.lbl_status.setText(f"Test finished in {t:.2f}s")
         self.log_msg.emit(f"🧪 Test Sample: {os.path.basename(f)} (Time: {t:.2f}s)")
@@ -786,20 +981,23 @@ class CaptionsTab(QWidget):
                 return
 
         self._manual_stop = False
+        self._batch_had_error = False
         self.toggle_ui(False)
         self.btn_stop.setEnabled(True)
         self.btn_unload.setEnabled(False) # Disable Unload
         
         self.start_time = time.time()
-        self.progress.setValue(0)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("Scanning files...")
         
         self.lbl_status.setText("Initializing...")
         self.log_msg.emit("🚀 Starting processing...")
 
         p = self.txt_prompt.toPlainText() + "\n" + self.txt_suffix.toPlainText()
-        effective_batch = 1 if getattr(self.engine, "is_gguf", False) else self.spin_batch.value()
+        effective_batch = 1 if self.engine.is_api or getattr(self.engine, "is_gguf", False) else self.spin_batch.value()
         settings = {
             "batch_size": effective_batch, "skip_existing": self.chk_skip.isChecked(),
+            "api_concurrency": self.spin_batch.value() if self.engine.is_api else 1,
             "frame_count": self.spin_frames.value(), "max_tokens": self.spin_tokens.value(),
             "prompt": p, "trigger": self.txt_trigger.text(), "use_masks": self.chk_use_masks.isChecked(),
             "recursive": self.recursive
@@ -810,11 +1008,17 @@ class CaptionsTab(QWidget):
         # Connect to custom progress handler for stats
         self.worker.signals.progress.connect(self.on_progress_update)
         
-        self.worker.signals.total.connect(self.progress.setMaximum)
+        self.worker.signals.total.connect(self.on_batch_total)
         self.worker.signals.log.connect(self.log_msg.emit)
-        self.worker.signals.image_processed.connect(lambda f, c: (self.lbl_preview.set_image(f), self.txt_preview.setText(c)))
+        self.worker.signals.image_processed.connect(lambda f, c: (self.lbl_preview.set_image(f), self.txt_preview.setPlainText(c)))
+        self.worker.signals.error.connect(self.on_batch_error)
         self.worker.signals.finished.connect(self.on_process_done)
         self.worker.start()
+
+    def on_batch_total(self, total):
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(0)
+        self.progress.setFormat(f"0 / {total} (0.00%)")
 
     def on_progress_update(self, val, speed_per_item):
         """
@@ -823,6 +1027,9 @@ class CaptionsTab(QWidget):
                         -1.0 if the update was purely skipped files.
         """
         self.progress.setValue(val)
+        total = self.progress.maximum()
+        percent = 100.0 * val / total if total > 0 else 0.0
+        self.progress.setFormat(f"{val} / {total} ({percent:.2f}%)")
         
         # Only update text stats if we have a valid speed from actual generation
         if speed_per_item > 0:
@@ -830,7 +1037,7 @@ class CaptionsTab(QWidget):
             eta_seconds = remaining_items * speed_per_item
             
             # Calculate Batch Speed (GGUF runs serially, treat as batch of 1)
-            current_batch_size = 1 if getattr(self.engine, "is_gguf", False) else self.spin_batch.value()
+            current_batch_size = 1 if self.engine.is_api or getattr(self.engine, "is_gguf", False) else self.spin_batch.value()
 
             # Base string
             speed_str = f"{speed_per_item:.2f} s/item"
@@ -855,21 +1062,34 @@ class CaptionsTab(QWidget):
 
     def stop_processing(self):
         self._manual_stop = True
-        self.log_msg.emit("🛑 Stopping... Please wait for the current batch to finish.")
+        self.log_msg.emit("🛑 Stopping: no new requests will be started. Waiting for active requests and saving completed captions." if self.engine.is_api
+                          else "🛑 Stopping... Please wait for the current batch to finish.")
         self.lbl_status.setText("Stopping...")
         self.btn_stop.setEnabled(False) # Prevent double-clicking
         if self.worker:
             self.worker.stop()
 
+    def on_batch_error(self, message):
+        self._batch_had_error = True
+        self.txt_preview.setPlainText(message)
+        self.log_msg.emit(message if message.startswith("Error:") else f"Error: {message}")
+
     def on_process_done(self, elapsed, speed):
         self.toggle_ui(True)
         self.btn_stop.setEnabled(False)
         self.btn_unload.setEnabled(True) # Re-enable Unload
-        self.lbl_status.setText(f"Complete. Total: {elapsed:.1f}s | Avg: {speed:.2f} s/item")
+        if getattr(self, '_batch_had_error', False):
+            self.lbl_status.setText("Processing finished with errors. See log.")
+        elif getattr(self, '_manual_stop', False):
+            self.lbl_status.setText("Stopped. Completed captions have been kept.")
+        else:
+            self.lbl_status.setText(f"Complete. Total: {elapsed:.1f}s | Avg: {speed:.2f} s/item")
+        if self.worker:
+            self.log_msg.emit(f"Saved: {self.worker.saved_count} | Failed: {self.worker.failed_count} | Skipped: {self.worker.skipped_count}")
         self.log_msg.emit(f"Done. Total time: {elapsed:.2f}s")
         self.batch_finished.emit()
 
-        if self.chk_shutdown.isChecked() and not getattr(self, '_manual_stop', False):
+        if self.chk_shutdown.isChecked() and not getattr(self, '_manual_stop', False) and not getattr(self, '_batch_had_error', False):
             self.log_msg.emit("Shutdown countdown started (60 s)...")
             dlg = ShutdownCountdownDialog(seconds=60, parent=self)
             if dlg.exec() == ShutdownCountdownDialog.Rejected:

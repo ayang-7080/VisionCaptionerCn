@@ -22,6 +22,7 @@ models/*
 
 # Virtual Environment
 venv/
+.test-venv/
 
 # Embedded portable Python runtime (only for Windows zip distribution)
 runtime/
@@ -29,6 +30,11 @@ runtime/
 # Configuration files (the GUI will create this)
 settings.json
 model_cache.json
+
+# Local credentials
+.env
+.env.*
+!.env.example
 
 # Personal notes
 ideas.md

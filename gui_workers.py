@@ -19,6 +19,28 @@ class WorkerSignals(QObject):
     error = Signal(str)
 
 # --- WORKERS ---
+class ApiChatTestWorker(QThread):
+    result_ready = Signal(bool, str)
+
+    def __init__(self, client, prompt, max_tokens=256, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.prompt = prompt
+        self.max_tokens = max_tokens
+
+    def run(self):
+        try:
+            result = self.client.test_chat(self.prompt, max_tokens=self.max_tokens)
+            success = True
+        except Exception as exc:
+            result = str(exc) if isinstance(exc, ValueError) else "API conversation test failed."
+            if self.client.api_key:
+                result = result.replace(self.client.api_key, "[redacted]")
+            success = False
+        if not self.isInterruptionRequested():
+            self.result_ready.emit(success, result)
+
+
 class GPUMonitorWorker(QThread):
     stats_update = Signal(float, float, float, int, bool)
 
@@ -129,8 +151,17 @@ class GPUMonitorWorker(QThread):
         compressed = pages("Pages occupied by compressor")
         return (active + wired + compressed) * page
 
+def caption_scan_error(folder, recursive):
+    if not os.path.isdir(folder):
+        return "Image folder does not exist. Select an existing folder."
+    if not recursive:
+        return "No supported images/videos found at the top level. Enable 'Include subfolders' if your images are in subfolders."
+    return "No supported images/videos found in this folder or its subfolders."
+
+
 class TestWorker(QThread):
     result_ready = Signal(str, str, float) 
+    target_ready = Signal(str)
     error = Signal(str)
     log_signal = Signal(str) 
     
@@ -143,15 +174,22 @@ class TestWorker(QThread):
 
     def run(self):
         recursive = self.settings.get('recursive', False)
-        pairs = self.engine.find_files(self.image_folder, skip_existing=False, recursive=recursive)
+        try:
+            pairs = self.engine.find_files(self.image_folder, skip_existing=False, recursive=recursive)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
         if not pairs:
-            self.error.emit("No images found.")
+            self.error.emit(caption_scan_error(self.image_folder, recursive))
             return
 
         target_pair = pairs[0] if self.mode == "first" else random.choice(pairs)
         target_file, mask_file = target_pair
 
         self.log_signal.emit(f"Test Target: {os.path.basename(target_file)}")
+        self.target_ready.emit(target_file)
+        if getattr(self.engine, "is_api", False):
+            self.log_signal.emit(f"Online API model: {self.engine.api_client.model}")
 
         use_masks = self.settings.get('use_masks', True)
 
@@ -171,6 +209,9 @@ class TestWorker(QThread):
             if self.isInterruptionRequested() or not captions:
                 return
 
+            if captions[0].startswith(("Error:", "[Video Load Error]", "[Video Error]")):
+                self.error.emit(captions[0])
+                return
             self.result_ready.emit(target_file, captions[0], time.time() - start_t)
             gc.collect()
         except Exception as e:
@@ -184,16 +225,30 @@ class CaptionWorker(QThread):
         self.settings = settings
         self.signals = WorkerSignals()
         self.is_running = True
+        self.saved_count = 0
+        self.failed_count = 0
+        self.skipped_count = 0
 
     def run(self):
         recursive = self.settings.get('recursive', False)
-        all_pairs = self.engine.find_files(self.image_folder, skip_existing=False, recursive=recursive)
+        try:
+            all_pairs = self.engine.find_files(self.image_folder, skip_existing=False, recursive=recursive)
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+            self.signals.finished.emit(0, 0)
+            return
         total = len(all_pairs)
         self.signals.total.emit(total)
         self.signals.log.emit(f"Found {total} files.")
 
         if total == 0:
+            self.signals.error.emit(caption_scan_error(self.image_folder, recursive))
             self.signals.finished.emit(0, 0)
+            return
+
+        if getattr(self.engine, "is_api", False):
+            self.signals.log.emit(f"Online API model: {self.engine.api_client.model}")
+            self._run_online(all_pairs)
             return
 
         batch_size = self.settings['batch_size']
@@ -232,6 +287,7 @@ class CaptionWorker(QThread):
 
             # 1. Handle SKIPPED files
             if skipped > 0:
+                self.skipped_count += skipped
                 processed_count += skipped
                 # We emit -1.0 for speed to tell UI "Don't update speed, just update progress bar"
                 self.signals.progress.emit(processed_count, -1.0) 
@@ -245,6 +301,7 @@ class CaptionWorker(QThread):
                 
                 # Measure ONLY the generation time
                 t0 = time.time()
+                accounted_in_batch = 0
                 try:
                     captions = self.engine.generate_batch(
                         files, 
@@ -263,13 +320,18 @@ class CaptionWorker(QThread):
                     # Save files (Error logic handled in previous fix)
                     for idx, f_path in enumerate(files):
                         caption = captions[idx]
-                        if caption.startswith("Error") or caption.startswith("[Video Load Error]"):
+                        if caption.startswith(("Error", "[Video Load Error]", "[Video Error]")):
+                            self.failed_count += 1
+                            accounted_in_batch += 1
                             self.signals.log.emit(f"⚠️ Skipping save for {os.path.basename(f_path)}: {caption}")
+                            self.signals.error.emit(caption)
                             continue
 
                         txt_path = os.path.splitext(f_path)[0] + ".txt"
                         with open(txt_path, "w", encoding="utf-8") as f:
                             f.write(caption)
+                        self.saved_count += 1
+                        accounted_in_batch += 1
                     
                     # Calculate Speed
                     t1 = time.time()
@@ -291,6 +353,7 @@ class CaptionWorker(QThread):
                     gc.collect()
 
                 except Exception as e:
+                    self.failed_count += len(files) - accounted_in_batch
                     self.signals.error.emit(str(e))
                     break
             
@@ -299,6 +362,48 @@ class CaptionWorker(QThread):
 
         elapsed_total = time.time() - start_time_global
         self.signals.finished.emit(elapsed_total, avg_speed)
+
+    def _run_online(self, all_pairs):
+        from online_batch import iter_online_results, save_online_caption, select_online_pairs
+        started = time.monotonic()
+        completed = 0
+        attempted = 0
+        average = 0.0
+        stop_check = lambda: self.isInterruptionRequested() or not self.is_running
+        try:
+            pending, self.skipped_count = select_online_pairs(all_pairs, self.settings['skip_existing'], stop_check)
+            completed = self.skipped_count
+            self.signals.progress.emit(completed, -1.0)
+            concurrency = self.settings.get('api_concurrency', 1)
+            self.signals.log.emit(f"API concurrency: {concurrency} | Pending: {len(pending)} | Skipped: {self.skipped_count}")
+            for path, caption in iter_online_results(
+                    self.engine, pending, concurrency=concurrency,
+                    prompt_text=self.settings['prompt'], trigger_word=self.settings['trigger'],
+                    frame_count=self.settings['frame_count'], max_tokens=self.settings['max_tokens'],
+                    use_masks=self.settings.get('use_masks', True), stop_event=stop_check,
+                    log_callback=self.signals.log.emit):
+                if caption.startswith(("Error:", "[Video Load Error]", "[Video Error]")):
+                    self.failed_count += 1
+                    self.signals.error.emit(caption)
+                else:
+                    try:
+                        if save_online_caption(path, caption, skip_existing=self.settings['skip_existing']):
+                            self.saved_count += 1
+                        else:
+                            self.skipped_count += 1
+                    except OSError as exc:
+                        self.failed_count += 1
+                        self.signals.error.emit(f"Could not save {os.path.basename(path)}: {exc}")
+                completed += 1
+                attempted += 1
+                average = (time.monotonic() - started) / attempted
+                self.signals.progress.emit(completed, average)
+                self.signals.image_processed.emit(path, caption)
+                self.signals.log.emit(f"Completed {completed}/{len(all_pairs)} | Saved: {self.saved_count} | Failed: {self.failed_count} | {os.path.basename(path)}")
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+        finally:
+            self.signals.finished.emit(time.monotonic() - started, average)
 
     def stop(self):
         self.is_running = False

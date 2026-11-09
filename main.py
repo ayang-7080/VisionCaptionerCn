@@ -6,7 +6,7 @@ import re
 # === FAST IMPORTS (PySide6 core) - Load immediately for splash screen ===
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QCheckBox,
                                QHBoxLayout, QPushButton, QFileDialog, QTabWidget,
-                               QTextEdit, QProgressBar, QLabel, QGroupBox, QSplashScreen, QSplitter)
+                               QTextEdit, QProgressBar, QLabel, QGroupBox, QSplashScreen, QSplitter, QSizePolicy)
 from PySide6.QtGui import QIcon, QPixmap, QFont, QColor, QTextCursor, QDesktopServices
 from PySide6.QtCore import Qt, QByteArray, QUrl, Signal, QObject
 from PySide6.QtMultimedia import QSoundEffect
@@ -53,7 +53,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vision Captioner")
-        self.resize(1200, 950)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1400, screen.width() - 40), min(850, screen.height() - 60))
         
         # Instantiate Engines Centrally
         self.engine = QwenEngine()       # For Captioning
@@ -97,6 +98,7 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
+        self.setMinimumSize(980, 620)
         layout = QVBoxLayout(main_widget)
 
         top_bar = QHBoxLayout()
@@ -138,6 +140,10 @@ class MainWindow(QMainWindow):
 
         # Initialize Tabs
         self.tabs = QTabWidget()
+        # Inactive tabs have large minimum size hints. Do not let those hints
+        # force the whole window taller than the screen while captioning.
+        self.tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.tabs.setMinimumSize(640, 320)
         
         # 1. Video Extraction Tab (New)
         self.tab_video = VideoTab(self.sam_engine)
@@ -174,14 +180,16 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.tab_gen)
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
-        # --- REFACTOR: SPLITTER FOR LOGS ---
-        self.main_splitter = QSplitter(Qt.Vertical)
-        self.main_splitter.addWidget(self.tabs)
+        # Main workspace and independently resizable right-hand log panel.
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setHandleWidth(7)
+        self.main_splitter.setChildrenCollapsible(False)
         
         # Bottom Container (Stats + Log + Footer)
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.addWidget(self.tabs, 1)
 
         stats_group = QGroupBox()
         stats_layout = QHBoxLayout(stats_group)
@@ -192,14 +200,20 @@ class MainWindow(QMainWindow):
         """
         self.bar_vram = QProgressBar(); self.bar_vram.setStyleSheet(bar_style); self.bar_vram.setFormat("GPU Mem: %v GB")
         self.bar_gpu = QProgressBar(); self.bar_gpu.setStyleSheet(bar_style); self.bar_gpu.setFormat("Core: %p%")
+        self.bar_vram.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.bar_gpu.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         stats_layout.addWidget(QLabel("GPU Mem:")); stats_layout.addWidget(self.bar_vram)
         stats_layout.addWidget(QLabel("GPU Load:")); stats_layout.addWidget(self.bar_gpu)
         bottom_layout.addWidget(stats_group)
 
-        self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True) 
-        # Height is now controlled by splitter, but set a sensible minimum
-        self.txt_log.setMinimumHeight(50)
-        bottom_layout.addWidget(self.txt_log)
+        self.log_panel = QGroupBox("Activity Log")
+        self.log_panel.setMinimumWidth(230)
+        log_layout = QVBoxLayout(self.log_panel)
+        self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True)
+        self.txt_log.setMinimumSize(200, 120)
+        self.txt_log.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.txt_log.setToolTip("Drag the divider to resize the log panel.")
+        log_layout.addWidget(self.txt_log)
         
         # --- FOOTER (Version + Link) ---
         footer_layout = QHBoxLayout()
@@ -211,6 +225,7 @@ class MainWindow(QMainWindow):
         
         version_str = f"Python: {py_ver}    |    PyTorch: {pt_ver}"
         self.lbl_version = QLabel(version_str)
+        self.lbl_version.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_version.setStyleSheet("color: #777; font-size: 11px;")
         footer_layout.addWidget(self.lbl_version)
         
@@ -224,9 +239,11 @@ class MainWindow(QMainWindow):
         bottom_layout.addLayout(footer_layout)
         
         self.main_splitter.addWidget(bottom_widget)
+        self.main_splitter.addWidget(self.log_panel)
         # Set initial sizes (give most space to tabs)
-        self.main_splitter.setStretchFactor(0, 1)
-        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([1000, 300])
         
         layout.addWidget(self.main_splitter)
         # -----------------------------------
@@ -376,6 +393,7 @@ class MainWindow(QMainWindow):
         data = { "folder": self.txt_folder.text(), "recursive": self.chk_recursive.isChecked(),
                  "geometry": self.saveGeometry().toHex().data().decode(),
                  "main_splitter_state": self.main_splitter.saveState().toHex().data().decode(),
+                 "main_layout_version": 2,
                  "generate_tab": self.tab_gen.get_settings(), "review_tab": self.tab_rev.get_settings(),
                  "mask_tab": self.tab_mask.get_settings(), "video_tab": self.tab_video.get_settings(),
                  "qa_tab": self.tab_qa.get_settings() }
@@ -388,7 +406,8 @@ class MainWindow(QMainWindow):
             try:
                 with open(SETTINGS_FILE, 'r') as f: data = json.load(f)
                 if "geometry" in data: self.restoreGeometry(QByteArray.fromHex(data["geometry"].encode()))
-                if "main_splitter_state" in data: self.main_splitter.restoreState(QByteArray.fromHex(data["main_splitter_state"].encode()))
+                if data.get("main_layout_version") == 2 and "main_splitter_state" in data:
+                    self.main_splitter.restoreState(QByteArray.fromHex(data["main_splitter_state"].encode()))
                 if "recursive" in data: self.chk_recursive.setChecked(data["recursive"])
                 if "folder" in data: self.txt_folder.setText(data["folder"])
                 if "generate_tab" in data: self.tab_gen.set_settings(data["generate_tab"])
@@ -397,6 +416,9 @@ class MainWindow(QMainWindow):
                 if "video_tab" in data: self.tab_video.set_settings(data["video_tab"])
                 if "qa_tab" in data: self.tab_qa.set_settings(data["qa_tab"])
             except Exception as e: print(f"Failed to load settings: {e}")
+        if not self.isMaximized():
+            screen = self.screen().availableGeometry()
+            self.resize(min(self.width(), screen.width() - 20), min(self.height(), screen.height() - 40))
 
     def closeEvent(self, event):
         # Restore streams
@@ -404,6 +426,10 @@ class MainWindow(QMainWindow):
         sys.stderr = self._original_stderr
         
         self.save_settings()
+        if self.tab_gen.api_test_worker and self.tab_gen.api_test_worker.isRunning():
+            # Network requests have a timeout; suppress results while the app exits.
+            self.tab_gen.api_test_worker.requestInterruption()
+            self.tab_gen.api_test_worker.wait(100)
         if self.gpu_monitor and self.gpu_monitor.isRunning():
             self.gpu_monitor.requestInterruption(); self.gpu_monitor.wait(500)
         if self.tab_gen.worker and self.tab_gen.worker.isRunning():

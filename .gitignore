@@ -30,6 +30,8 @@ runtime/
 # Configuration files (the GUI will create this)
 settings.json
 model_cache.json
+i18n/pending.json
+.pytest_cache/
 
 # Local credentials
 .env

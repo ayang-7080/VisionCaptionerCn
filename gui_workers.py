@@ -203,7 +203,8 @@ class TestWorker(QThread):
                 mask_paths=[mask_file] if use_masks else [None],
                 max_tokens=self.settings['max_tokens'],
                 log_callback=lambda m: self.log_signal.emit(m),
-                stop_event=self.isInterruptionRequested
+                stop_event=self.isInterruptionRequested,
+                include_folder_context=self.settings.get('include_folder_context', False)
             )
             
             if self.isInterruptionRequested() or not captions:
@@ -311,7 +312,8 @@ class CaptionWorker(QThread):
                         mask_paths=masks, 
                         max_tokens=self.settings['max_tokens'],
                         log_callback=lambda m: self.signals.log.emit(m),
-                        stop_event=stop_check
+                        stop_event=stop_check,
+                        include_folder_context=self.settings.get('include_folder_context', False)
                     )
                     
                     if not self.is_running: break
@@ -381,7 +383,8 @@ class CaptionWorker(QThread):
                     prompt_text=self.settings['prompt'], trigger_word=self.settings['trigger'],
                     frame_count=self.settings['frame_count'], max_tokens=self.settings['max_tokens'],
                     use_masks=self.settings.get('use_masks', True), stop_event=stop_check,
-                    log_callback=self.signals.log.emit):
+                    log_callback=self.signals.log.emit,
+                    include_folder_context=self.settings.get('include_folder_context', False)):
                 if caption.startswith(("Error:", "[Video Load Error]", "[Video Error]")):
                     self.failed_count += 1
                     self.signals.error.emit(caption)

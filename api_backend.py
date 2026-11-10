@@ -13,6 +13,7 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 from PIL import Image, ImageOps
 from file_utils import VIDEO_EXTS
+from prompt_context import with_folder_context
 
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_API_MODEL = "gpt-6.1-sol"
@@ -181,13 +182,13 @@ class ApiCaptionClient:
 
     def generate_batch(self, media_engine, file_paths, prompt_text="Describe this.", trigger_word="",
                        frame_count=8, mask_paths=None, max_tokens=1024, log_callback=None, stop_event=None,
-                       raise_errors=False):
+                       raise_errors=False, include_folder_context=False):
         results = []
         for index, path in enumerate(file_paths):
             if stop_event and stop_event():
                 return []
             try:
-                prompt = prompt_text
+                prompt = with_folder_context(prompt_text, path, include_folder_context)
                 mask = mask_paths[index] if mask_paths and index < len(mask_paths) else None
                 if os.path.splitext(path)[1].lower() in {ext.lstrip("*") for ext in VIDEO_EXTS}:
                     images = media_engine.extract_video_frames(path, num_frames=frame_count,

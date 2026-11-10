@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # 中文界面启动器: 通过 launcher.py 外挂汉化, 不修改项目源码
 # 环境统一基于 uv (https://docs.astral.sh/uv/), 首次运行自动创建 venv 并安装依赖
@@ -19,7 +20,7 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # 2. venv 不存在则初始化 (只需一次, 与说明.txt 的 Windows 流程一致)
-if [ ! -f "venv/bin/activate" ]; then
+if [ ! -x "venv/bin/python" ]; then
     echo "首次运行: 创建 venv 并安装依赖 (含 torch cu126, 下载量较大请耐心等待)..."
     uv venv venv --seed --python 3.12
     # CUDA 12.6 版 torch, 需要驱动 >= 560
@@ -28,6 +29,5 @@ if [ ! -f "venv/bin/activate" ]; then
     uv pip install --python venv/bin/python -r requirements.txt
 fi
 
-# 3. 激活环境并启动 (首次使用前可先验证汉化钩子: python launcher.py --selftest)
-source venv/bin/activate
-python launcher.py
+# 3. 直接使用项目解释器启动 (可传 --selftest 验证汉化钩子)
+exec "venv/bin/python" launcher.py "$@"

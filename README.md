@@ -89,6 +89,10 @@ Linux 注意事项：
 | `run.bat` / `run.sh` | Win / Linux | 英文原版界面 |
 | `run_portable.bat` | Windows | 绿色便携版启动，需项目内含 `runtime\` 文件夹（仅随 zip 分发包提供，**git clone 不包含**，请走上面的 uv 安装流程） |
 
+Windows 启动脚本会直接检查本项目的 Python：优先使用 `venv`；若虚拟环境因目录搬迁而失效，自动尝试 `runtime` 加 `venv/Lib/site-packages` 的便携环境。`run_portable.bat` 始终使用便携环境。缺少环境时会显示错误，不会调用系统里不确定的 Python。
+
+启动排查：在终端运行 `run_cn.bat --check`（英文入口和便携入口也支持 `--check`），检查实际依赖能否导入；运行 `run_cn.bat --selftest` 验证汉化钩子。这些检查不加载模型权重、不发送 API 请求。Linux 首次安装任何一步失败都会停止，请修复错误后按上方安装命令完成依赖安装。
+
 汉化相关：
 
 *   首次使用可自检汉化钩子：`python launcher.py --selftest`

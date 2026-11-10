@@ -1,5 +1,6 @@
 """Real Qt UI checks; ML dependencies are mocked, no weights or API calls."""
 import os
+import json
 import sys
 import tempfile
 from contextlib import chdir
@@ -28,6 +29,32 @@ for filename in ("segoeui.ttf", "msyh.ttc"):
         QtGui.QFontDatabase.addApplicationFont(str(font_path))
 with tempfile.TemporaryDirectory() as directory, chdir(directory):
     tab = CaptionsTab(QwenEngine())
+    assert hasattr(tab, "chk_folder_context"), "Missing folder context checkbox"
+    assert not tab.chk_folder_context.isChecked()
+    assert tab.get_settings()["include_folder_context"] is False
+    tab.chk_folder_context.setChecked(True)
+    folder_settings = tab.get_settings()
+    restored_context = CaptionsTab(QwenEngine())
+    restored_context.set_settings(folder_settings)
+    assert restored_context.chk_folder_context.isChecked()
+    restored_context.set_settings({"prompt_text": "old settings"})
+    assert not restored_context.chk_folder_context.isChecked()
+    if os.environ.get("API_GUI_LANGUAGE") == "zh":
+        assert tab.chk_folder_context.text() == "将文件夹路径作为上下文"
+    tab.toggle_ui(False)
+    assert not tab.chk_folder_context.isEnabled()
+    tab.toggle_ui(True)
+    assert tab.chk_folder_context.isEnabled()
+    context_screenshot = os.environ.get("FOLDER_CONTEXT_SCREENSHOT")
+    if context_screenshot:
+        tab.resize(1200, 850)
+        tab.show()
+        app.processEvents()
+        for scroll in tab.findChildren(QtWidgets.QScrollArea):
+            if scroll.isAncestorOf(tab.chk_folder_context):
+                scroll.ensureWidgetVisible(tab.chk_folder_context)
+        app.processEvents()
+        assert tab.grab().save(context_screenshot)
     assert hasattr(tab, "combo_backend"), "Missing online/local mode selector"
     assert tab.combo_backend.currentData() == "local"
     tab.spin_batch.setValue(8)
@@ -164,6 +191,15 @@ with tempfile.TemporaryDirectory() as directory, chdir(directory):
         tab.btn_start.click()
         wait_for_media(tab.worker)
     assert request.call_count == 4
+    for call in request.call_args_list:
+        text = call.args[0][0]["text"]
+        assert json.dumps(str(nested), ensure_ascii=False) in text
+        assert text.count("[Folder context:") == 1
+    tab.chk_folder_context.setChecked(False)
+    with patch.object(ApiCaptionClient, "_request_caption", return_value="no folder") as request:
+        tab.btn_test_first.click()
+        wait_for_media(tab.test_worker)
+    assert "[Folder context:" not in request.call_args.args[0][0]["text"]
     assert len(list(nested.glob("*.txt"))) == 2
     assert tab.engine.api_client is client
     tab.on_batch_total(5271)

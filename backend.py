@@ -3,6 +3,7 @@ import base64
 import io
 import torch
 from file_utils import find_media_files, IMAGE_EXTS, VIDEO_EXTS
+from prompt_context import with_folder_context
 from transformers import AutoModelForImageTextToText, AutoProcessor, StoppingCriteria, StoppingCriteriaList
 from model_family import get_family, QwenFamily
 import gc
@@ -570,11 +571,12 @@ class QwenEngine:
             print(f"Error applying mask: {e}")
             return None
 
-    def generate_batch(self, file_paths, prompt_text="Describe this.", trigger_word="", frame_count=8, mask_paths=None, max_tokens=1024, log_callback=None, stop_event=None, raise_errors=False):
+    def generate_batch(self, file_paths, prompt_text="Describe this.", trigger_word="", frame_count=8, mask_paths=None, max_tokens=1024, log_callback=None, stop_event=None, raise_errors=False, include_folder_context=False):
         if self.is_api:
             return self.api_client.generate_batch(
                 self, file_paths, prompt_text, trigger_word, frame_count, mask_paths,
-                max_tokens, log_callback, stop_event, raise_errors=raise_errors)
+                max_tokens, log_callback, stop_event, raise_errors=raise_errors,
+                include_folder_context=include_folder_context)
         if not self.model: return ["Error: Model not loaded"] * len(file_paths)
 
         # --- GGUF GENERATION BRANCH ---
@@ -618,6 +620,7 @@ class QwenEngine:
                         pil_images = [pil_img]
                     
                     # 3. Construct Message
+                    local_prompt = with_folder_context(prompt_text, f_path, include_folder_context)
                     # Check if we have a valid chat_handler for vision
                     has_vision = hasattr(self.model, 'chat_handler') and self.model.chat_handler is not None
                     
@@ -626,7 +629,6 @@ class QwenEngine:
                         # Build content list with text first, then all images
                         
                         # Apply prompt modification for masks
-                        local_prompt = prompt_text
                         if mask_path and os.path.exists(mask_path):
                             local_prompt += " The background is masked and transparent. Describe the foreground subject ONLY. Do not mention the background or transparency."
                             
@@ -647,7 +649,7 @@ class QwenEngine:
                         b64_images = []
                         messages = [
                             {"role": "system", "content": "You are a helpful assistant."},
-                            {"role": "user", "content": prompt_text}
+                            {"role": "user", "content": local_prompt}
                         ]
 
                     # 4. Generate
@@ -724,7 +726,7 @@ class QwenEngine:
                             final_image_obj = f_path
 
                 # Apply prompt modification for masks
-                local_prompt = prompt_text
+                local_prompt = with_folder_context(prompt_text, f_path, include_folder_context)
                 if mask_path and os.path.exists(mask_path) and not is_video:
                     local_prompt += " The background is masked and transparent. Describe the foreground subject ONLY. Do not mention the background or transparency."
 

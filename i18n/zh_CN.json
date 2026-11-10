@@ -1,4 +1,6 @@
 {
+  "Include folder path as context": "将文件夹路径作为上下文",
+  "Add each file's full containing-folder path to its prompt as metadata. Tell the AI in your prompt how to use folder names. Works with local models and online APIs; when enabled, the path is sent to the selected provider.": "将每张图片或视频所在文件夹的完整路径作为元数据加入提示词。请在提示词中说明如何使用文件夹名称。本地模型和在线 API 均支持；开启后，路径会随请求发送给所选服务商。",
   "API Concurrency:": "API 并发数：",
   "Maximum simultaneous API requests (1–32). Completed captions are saved immediately. Lower this if your provider rate-limits requests.": "同时进行的 API 请求数量（1–32）。每张完成后立即保存；如触发服务商限流，请降低并发数。",
   "Activity Log": "运行日志",

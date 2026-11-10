@@ -55,6 +55,7 @@ def load_defaults_from_settings():
             "trigger": data.get("generate_tab", {}).get("trigger", ""),
             "prompt": data.get("generate_tab", {}).get("prompt_text", ""),
             "prompt_suffix": data.get("generate_tab", {}).get("suffix", ""),
+            "include_folder_context": api_data.get("include_folder_context", False),
             "skip_existing": data.get("generate_tab", {}).get("skip_existing", False),
             "vision_tokens": data.get("generate_tab", {}).get("vision_tokens", None)
         }
@@ -143,6 +144,9 @@ def main():
     grp_cap.add_argument("--max-tokens", type=int, default=defaults.get("max_tokens", 384), help="Max output tokens.")
     grp_cap.add_argument("--prompt", type=str, default=defaults.get("prompt", "Describe this image."), help="System prompt.")
     grp_cap.add_argument("--suffix", type=str, default=defaults.get("prompt_suffix", ""), help="Suffix to append to prompt.")
+    grp_cap.add_argument("--include-folder-context", action=argparse.BooleanOptionalAction,
+                         default=defaults.get("include_folder_context", False),
+                         help="Include each file's full folder path as prompt metadata (also sent to online APIs).")
     grp_cap.add_argument("--trigger", type=str, default=defaults.get("trigger", ""), help="Trigger word to prepend to caption.")
     grp_cap.add_argument("--vision-tokens", type=int, default=defaults.get("vision_tokens"), choices=[70, 140, 280, 560, 1120], help="Gemma 4 vision token budget per image (ignored for Qwen).")
     
@@ -259,7 +263,8 @@ def main():
                                 engine, pending, concurrency=args.api_concurrency,
                                 prompt_text=final_prompt, trigger_word=args.trigger,
                                 frame_count=args.frame_count, max_tokens=args.max_tokens,
-                                log_callback=print, stop_event=stop.is_set):
+                                log_callback=print, stop_event=stop.is_set,
+                                include_folder_context=args.include_folder_context):
                             if caption.startswith("Error:"):
                                 print(f"Skipping {os.path.basename(path)}: {caption}")
                             else:
@@ -294,7 +299,8 @@ def main():
                         frame_count=args.frame_count,
                         mask_paths=final_masks,
                         max_tokens=args.max_tokens,
-                        log_callback=None
+                        log_callback=None,
+                        include_folder_context=args.include_folder_context
                     )
 
                     for idx, f_path in enumerate(final_files):

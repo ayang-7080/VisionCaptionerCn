@@ -19,7 +19,8 @@ def wait_before_retry(seconds, stop_event):
 
 
 def iter_online_results(engine, pairs, concurrency=1, prompt_text="Describe this.", trigger_word="",
-                        frame_count=8, max_tokens=1024, use_masks=True, log_callback=None, stop_event=None):
+                        frame_count=8, max_tokens=1024, use_masks=True, log_callback=None, stop_event=None,
+                        include_folder_context=False):
     """Keep at most N requests submitted; on stop, drain active results only.
 
     The caller saves results on its own thread, as soon as each request finishes.
@@ -40,7 +41,8 @@ def iter_online_results(engine, pairs, concurrency=1, prompt_text="Describe this
                 captions = engine.generate_batch(
                     [path], prompt_text=prompt_text, trigger_word=trigger_word,
                     frame_count=frame_count, mask_paths=[mask if use_masks else None],
-                    max_tokens=max_tokens, log_callback=log_callback, raise_errors=True)
+                    max_tokens=max_tokens, log_callback=log_callback, raise_errors=True,
+                    include_folder_context=include_folder_context)
                 return captions[0] if captions else "Error: API returned no caption."
             except ApiRequestError as exc:
                 retryable = (exc.status in (429, 502, 503, 504)

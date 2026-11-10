@@ -1,24 +1,4 @@
 @echo off
-setlocal
-
-REM Get the directory where this script is located
-set "SCRIPT_DIR=%~dp0"
-cd /d "%SCRIPT_DIR%"
-
-title Launching VisionCaptioner...
-
-echo.
-echo ------------------------------------------
-echo       STARTING VISION CAPTIONER
-echo ------------------------------------------
-echo.
-echo Activating environment...
-call "venv\Scripts\activate.bat"
-
-echo.
-echo Launching GUI...
-echo (The Splash Screen should appear momentarily)
-
-start "" pythonw.exe main.py
-
-endlocal
+REM Use --check to validate dependencies, or --selftest for Chinese UI hooks.
+call "%~dp0launch_windows.bat" main.py auto %*
+exit /b %errorlevel%

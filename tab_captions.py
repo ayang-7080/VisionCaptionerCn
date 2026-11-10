@@ -272,6 +272,14 @@ class CaptionsTab(QWidget):
         )
         left_layout.addWidget(self.txt_prompt)
 
+        self.chk_folder_context = QCheckBox("Include folder path as context")
+        self.chk_folder_context.setToolTip(
+            "Add each file's full containing-folder path to its prompt as metadata. "
+            "Tell the AI in your prompt how to use folder names. "
+            "Works with local models and online APIs; when enabled, the path is sent to the selected provider."
+        )
+        left_layout.addWidget(self.chk_folder_context)
+
         left_layout.addSpacing(10)
         left_layout.addWidget(QLabel("Append to System Prompt (Always active):"))
         self.txt_suffix = QTextEdit()
@@ -622,12 +630,14 @@ class CaptionsTab(QWidget):
             "trigger": self.txt_trigger.text(),
             "system_prompt_idx": self.combo_prompts.currentIndex(),
             "prompt_text": self.txt_prompt.toPlainText(),
+            "include_folder_context": self.chk_folder_context.isChecked(),
             "suffix": self.txt_suffix.toPlainText(),
             "splitter_state": self.splitter.saveState().toHex().data().decode()
         }
 
     def set_settings(self, settings):
         """Loads settings from a dict."""
+        self.chk_folder_context.setChecked(bool((settings or {}).get("include_folder_context", False)))
         if not settings: return
 
         self.txt_api_url.setText(settings.get("api_base_url") or DEFAULT_API_BASE_URL)
@@ -888,6 +898,7 @@ class CaptionsTab(QWidget):
         settings_enabled = enabled and not loaded
         online = self.combo_backend.currentData() == "api"
         self.combo_backend.setEnabled(enabled)
+        self.chk_folder_context.setEnabled(enabled)
         self.api_group.setEnabled(enabled and online)
         for widget in (self.txt_api_url, self.txt_api_key, self.txt_api_model,
                        self.spin_api_timeout, self.chk_remember_api_key):
@@ -929,6 +940,7 @@ class CaptionsTab(QWidget):
         
         p = self.txt_prompt.toPlainText() + "\n" + self.txt_suffix.toPlainText()
         settings = {"frame_count": self.spin_frames.value(), "max_tokens": self.spin_tokens.value(), "prompt": p, "trigger": self.txt_trigger.text(), "use_masks": self.chk_use_masks.isChecked(), "recursive": self.recursive}
+        settings["include_folder_context"] = self.chk_folder_context.isChecked()
 
         self.lbl_status.setText("Testing..." if mode == "random" else "Testing First Image...")
         self.txt_preview.clear()
@@ -1000,6 +1012,7 @@ class CaptionsTab(QWidget):
             "api_concurrency": self.spin_batch.value() if self.engine.is_api else 1,
             "frame_count": self.spin_frames.value(), "max_tokens": self.spin_tokens.value(),
             "prompt": p, "trigger": self.txt_trigger.text(), "use_masks": self.chk_use_masks.isChecked(),
+            "include_folder_context": self.chk_folder_context.isChecked(),
             "recursive": self.recursive
         }
 
